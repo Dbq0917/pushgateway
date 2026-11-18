@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
@@ -1073,8 +1074,8 @@ func TestRejectTimestamps(t *testing.T) {
 	})
 	var err error
 	for err = range errCh {
-		if err != errTimestamp {
-			t.Errorf("Expected error %q, got %q.", errTimestamp, err)
+		if err != ErrTimestamp {
+			t.Errorf("Expected error %q, got %q.", ErrTimestamp, err)
 		}
 	}
 	if err == nil {
@@ -1087,6 +1088,89 @@ func TestRejectTimestamps(t *testing.T) {
 		pushTimestamp, pushFailedTimestamp,
 	); err != nil {
 		t.Error(err)
+	}
+
+	if err := dms.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDroppedPushWithTimestampsCounted(t *testing.T) {
+	dms := NewDiskMetricStore("", 100*time.Millisecond, nil, logger)
+
+	grouping := map[string]string{
+		"job":      "job1",
+		"instance": "instance2",
+	}
+	droppedBefore := promtestutil.ToFloat64(
+		droppedPushes.WithLabelValues("job1", "instance2", reasonTimestampsPresent),
+	)
+
+	// A push carrying a timestamp 3h behind the Pushgateway's clock, as
+	// sent by a pusher with a slow clock, must be rejected and counted.
+	slowClockTimestamp := time.Now().Add(-3 * time.Hour)
+	mfSlow := &dto.MetricFamily{
+		Name: new("mf_slow"),
+		Type: dto.MetricType_UNTYPED.Enum(),
+		Metric: []*dto.Metric{
+			{
+				Untyped:     &dto.Untyped{Value: new(1.0)},
+				TimestampMs: proto.Int64(slowClockTimestamp.UnixMilli()),
+			},
+		},
+	}
+	errCh := make(chan error, 1)
+	dms.SubmitWriteRequest(WriteRequest{
+		Labels:         grouping,
+		Timestamp:      time.Now(),
+		MetricFamilies: testutil.MetricFamiliesMap(mfSlow),
+		Done:           errCh,
+	})
+	var err error
+	for err = range errCh {
+	}
+	if err != ErrTimestamp {
+		t.Errorf("Expected error %q, got %q.", ErrTimestamp, err)
+	}
+
+	// An unchecked push (no Done channel) carrying timestamps is dropped
+	// silently and must be counted as well. The following checked request
+	// is processed afterwards and synchronizes the test with the write
+	// queue.
+	dms.SubmitWriteRequest(WriteRequest{
+		Labels:         grouping,
+		Timestamp:      time.Now(),
+		MetricFamilies: testutil.MetricFamiliesMap(mfSlow),
+	})
+
+	// A normal push without timestamps must still be accepted and stored.
+	errCh = make(chan error, 1)
+	dms.SubmitWriteRequest(WriteRequest{
+		Labels:         grouping,
+		Timestamp:      time.Now(),
+		MetricFamilies: testutil.MetricFamiliesMap(mf2),
+		Done:           errCh,
+	})
+	for err := range errCh {
+		t.Errorf("Unexpected error on normal push: %v", err)
+	}
+	if got := dms.GetMetricFamiliesMap()[groupingKeyFor(grouping)].Metrics["mf2"]; got.GobbableMetricFamily == nil {
+		t.Error("Expected mf2 to be stored after normal push.")
+	}
+
+	droppedAfter := promtestutil.ToFloat64(
+		droppedPushes.WithLabelValues("job1", "instance2", reasonTimestampsPresent),
+	)
+	if expected, got := droppedBefore+2, droppedAfter; expected != got {
+		t.Errorf("Expected dropped pushes counter %v, got %v.", expected, got)
+	}
+
+	// The recorded skew must reflect the pusher's slow clock (~3h behind).
+	skew := promtestutil.ToFloat64(
+		droppedPushTimestampSkewSeconds.WithLabelValues("job1", "instance2"),
+	)
+	if expected := 3 * 3600.0; skew < expected-60 || skew > expected+60 {
+		t.Errorf("Expected clock skew around %v s, got %v s.", expected, skew)
 	}
 
 	if err := dms.Shutdown(); err != nil {
@@ -1277,8 +1361,8 @@ func TestReplace(t *testing.T) {
 	})
 	var err error
 	for err = range errCh {
-		if err != errTimestamp {
-			t.Errorf("Expected error %q, got %q.", errTimestamp, err)
+		if err != ErrTimestamp {
+			t.Errorf("Expected error %q, got %q.", ErrTimestamp, err)
 		}
 	}
 	if err == nil {
@@ -1349,8 +1433,8 @@ func TestReplace(t *testing.T) {
 	})
 	err = nil
 	for err = range errCh {
-		if err != errTimestamp {
-			t.Errorf("Expected error %q, got %q.", errTimestamp, err)
+		if err != ErrTimestamp {
+			t.Errorf("Expected error %q, got %q.", ErrTimestamp, err)
 		}
 	}
 	if err == nil {

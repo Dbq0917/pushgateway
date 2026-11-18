@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
@@ -40,9 +41,44 @@ const (
 	pushFailedMetricName = "push_failure_time_seconds"
 	pushFailedMetricHelp = "Last Unix time when changing this group in the Pushgateway failed."
 	writeQueueCapacity   = 1000
+
+	// reasonTimestampsPresent is the drop reason used for pushes rejected
+	// because they carry timestamps.
+	reasonTimestampsPresent = "timestamps_present"
+
+	// clockSkewWarnThreshold is the absolute clock skew between the
+	// Pushgateway and a pushed timestamp beyond which a clock
+	// synchronization hint is logged.
+	clockSkewWarnThreshold = 5 * time.Minute
 )
 
-var errTimestamp = errors.New("pushed metrics must not have timestamps")
+// ErrTimestamp is the error caused by pushed metrics that carry timestamps.
+// Such pushes are rejected (and dropped) by the Pushgateway.
+var ErrTimestamp = errors.New("pushed metrics must not have timestamps")
+
+var (
+	// droppedPushes counts pushes that were rejected and dropped, by
+	// reason and by the job/instance grouping of the pusher, so that the
+	// affected machine can be identified.
+	droppedPushes = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "pushgateway_dropped_pushes_total",
+			Help: "Total number of pushes rejected and dropped by the Pushgateway, by reason and by the job/instance grouping of the pusher.",
+		},
+		[]string{"job", "instance", "reason"},
+	)
+	// droppedPushTimestampSkewSeconds records the clock skew (Pushgateway
+	// receive time minus the newest pushed timestamp) observed in the most
+	// recent dropped push carrying timestamps. Positive values mean the
+	// pusher's clock is behind the Pushgateway's clock.
+	droppedPushTimestampSkewSeconds = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pushgateway_dropped_push_timestamp_skew_seconds",
+			Help: "Clock skew in seconds (Pushgateway time minus newest pushed timestamp) of the most recent dropped push carrying timestamps. Positive means the pusher's clock is behind.",
+		},
+		[]string{"job", "instance"},
+	)
+)
 
 // DiskMetricStore is an implementation of MetricStore that persists metrics to
 // disk.
@@ -361,7 +397,8 @@ func (dms *DiskMetricStore) checkWriteRequest(wr WriteRequest) bool {
 	}()
 
 	if timestampsPresent(wr.MetricFamilies) {
-		err = errTimestamp
+		err = ErrTimestamp
+		dms.recordDroppedPush(wr)
 		return false
 	}
 	for _, mf := range wr.MetricFamilies {
@@ -393,6 +430,54 @@ func (dms *DiskMetricStore) checkWriteRequest(wr WriteRequest) bool {
 		return false
 	}
 	return true
+}
+
+// recordDroppedPush counts a dropped push, records the observed clock skew,
+// and writes an audit log entry identifying the pusher by its job/instance
+// grouping. It is called for every WriteRequest dropped because it carries
+// timestamps, no matter if the push was consistency-checked or not.
+func (dms *DiskMetricStore) recordDroppedPush(wr WriteRequest) {
+	job := wr.Labels["job"]
+	instance := wr.Labels[string(model.InstanceLabel)]
+	droppedPushes.WithLabelValues(job, instance, reasonTimestampsPresent).Inc()
+
+	logAttrs := []any{
+		"job", job,
+		"instance", instance,
+		"reason", reasonTimestampsPresent,
+	}
+	if newestMs, ok := newestPushedTimestampMs(wr.MetricFamilies); ok {
+		newest := time.UnixMilli(newestMs)
+		skew := wr.Timestamp.Sub(newest)
+		droppedPushTimestampSkewSeconds.WithLabelValues(job, instance).Set(skew.Seconds())
+		logAttrs = append(logAttrs,
+			"newest_pushed_timestamp", newest.UTC().Format(time.RFC3339),
+			"clock_skew_seconds", skew.Seconds(),
+		)
+		if skew > clockSkewWarnThreshold || skew < -clockSkewWarnThreshold {
+			logAttrs = append(logAttrs,
+				"hint", "the pusher's clock appears to be out of sync, check time synchronization (e.g. NTP) on the pushing machine",
+			)
+		}
+	}
+	dms.logger.Warn("dropped push carrying timestamps", logAttrs...)
+}
+
+// newestPushedTimestampMs returns the newest (largest) timestamp in
+// milliseconds found in the provided metric families. The second return value
+// is false if no metric carries a timestamp.
+func newestPushedTimestampMs(metricFamilies map[string]*dto.MetricFamily) (int64, bool) {
+	var newest int64
+	found := false
+	for _, mf := range metricFamilies {
+		for _, m := range mf.GetMetric() {
+			if m.TimestampMs != nil && (!found || m.GetTimestampMs() > newest) {
+				newest = m.GetTimestampMs()
+				found = true
+			}
+		}
+	}
+	return newest, found
 }
 
 func (dms *DiskMetricStore) persist() error {

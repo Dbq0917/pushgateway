@@ -245,6 +245,25 @@ different timestamp, and many users attempting to incorrectly do so (despite no
 client library supporting this), the Pushgateway rejects any pushes with
 timestamps.
 
+Rejected pushes are dropped and accounted for in the metric
+`pushgateway_dropped_pushes_total`, labeled with the `job` and `instance`
+grouping of the pusher and a `reason` label (currently always
+`timestamps_present`), so that the machine sending the dropped pushes can be
+identified. In addition, the gauge
+`pushgateway_dropped_push_timestamp_skew_seconds` records, per `job`/`instance`
+grouping, the skew between the Pushgateway's clock and the newest pushed
+timestamp of the most recently dropped push. A large positive value means the
+pusher's clock is behind. Each dropped push is also logged as a warning with
+the same details. To get alerted about pushers with unsynchronized clocks, you
+could use an alert like:
+
+```yaml
+- alert: PushgatewayDroppedPushesWithTimestamps
+  expr: increase(pushgateway_dropped_pushes_total[5m]) > 0
+  annotations:
+    summary: Pushes with timestamps dropped for {{ $labels.job }}/{{ $labels.instance }}
+```
+
 If you think you need to push a timestamp, please see [When To Use The
 Pushgateway](https://prometheus.io/docs/practices/pushing/).
 

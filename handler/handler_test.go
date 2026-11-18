@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
@@ -434,6 +436,99 @@ func TestPush(t *testing.T) {
 	verifyMetricFamily(t, `name:"another_metric" type:UNTYPED metric:{untyped:{value:3.14}}`, mms.lastWriteRequest.MetricFamilies["another_metric"])
 	// Note that sanitation hasn't happened yet, grouping labels not in request.
 	verifyMetricFamily(t, `name:"histogram_metric" type:HISTOGRAM metric:{histogram:{sample_count_float:20  sample_sum:99.23  schema:1  negative_span:{offset:0  length:2}  negative_span:{offset:0  length:2}  negative_count:2  negative_count:2  negative_count:-2  negative_count:0  positive_span:{offset:0  length:2}  positive_span:{offset:0  length:2}  positive_count:2  positive_count:2  positive_count:-2  positive_count:0}}`, mms.lastWriteRequest.MetricFamilies["histogram_metric"])
+}
+
+// TestPushWithSlowClockTimestamp is the acceptance test for pushes coming
+// from a collector with a slow clock: a push carrying a timestamp hours in
+// the past must be either accepted or rejected with a clear error (the
+// Pushgateway rejects pushes with timestamps), the rejection must be counted
+// and attributable to the pushing machine, and a subsequent normal push
+// without timestamps must be accepted and stored.
+func TestPushWithSlowClockTimestamp(t *testing.T) {
+	dms := storage.NewDiskMetricStore("", 100*time.Millisecond, nil, logger)
+	defer func() {
+		if err := dms.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// No replace, check consistency, no base64 encoding.
+	handler := Push(dms, false, true, false, logger)
+	params := map[string]string{
+		"job":    "testjob",
+		"labels": "/instance/slowhost",
+	}
+
+	// Push with a timestamp 3h behind the Pushgateway's clock.
+	slowTimestampMs := time.Now().Add(-3 * time.Hour).UnixMilli()
+	req, err := http.NewRequest(
+		"POST", "http://example.org/",
+		bytes.NewBufferString(fmt.Sprintf("some_metric 42 %d\n", slowTimestampMs)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	handler(w, req.WithContext(ctxWithParams(params, req)))
+	if expected, got := http.StatusBadRequest, w.Code; expected != got {
+		t.Errorf("Wanted status code %v, got %v.", expected, got)
+	}
+	if want := "pushed metrics must not have timestamps"; !strings.Contains(w.Body.String(), want) {
+		t.Errorf("Expected a clear error containing %q, got %q.", want, w.Body.String())
+	}
+
+	// The dropped push must be counted and attributable to the pushing
+	// machine via the job/instance grouping labels.
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dropCounted := false
+	for _, mf := range mfs {
+		if mf.GetName() != "pushgateway_dropped_pushes_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["job"] == "testjob" && labels["instance"] == "slowhost" &&
+				labels["reason"] == "timestamps_present" && m.GetCounter().GetValue() >= 1 {
+				dropCounted = true
+			}
+		}
+	}
+	if !dropCounted {
+		t.Error("Expected dropped push to be counted with job/instance/reason labels.")
+	}
+
+	// A normal push without timestamps must be accepted and stored.
+	req, err = http.NewRequest(
+		"POST", "http://example.org/",
+		bytes.NewBufferString("some_metric 42\n"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	handler(w, req.WithContext(ctxWithParams(params, req)))
+	if expected, got := http.StatusOK, w.Code; expected != got {
+		t.Errorf("Wanted status code %v, got %v.", expected, got)
+	}
+	stored := false
+	for _, group := range dms.GetMetricFamiliesMap() {
+		if group.Labels["job"] != "testjob" || group.Labels["instance"] != "slowhost" {
+			continue
+		}
+		if mf := group.Metrics["some_metric"].GetMetricFamily(); mf != nil &&
+			mf.GetMetric()[0].GetUntyped().GetValue() == 42 {
+			stored = true
+		}
+	}
+	if !stored {
+		t.Error("Expected some_metric to be stored after normal push.")
+	}
 }
 
 func TestPushUTF8(t *testing.T) {
