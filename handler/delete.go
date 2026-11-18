@@ -16,6 +16,7 @@ package handler
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"time"
 
@@ -53,10 +54,38 @@ func Delete(ms storage.MetricStore, jobBase64Encoded bool, logger *slog.Logger) 
 				return
 			}
 			labels["job"] = job
+
+			// Determine whether the group currently exists so that the
+			// outcome of the delete can be confirmed and audited.
+			existed := false
+			for _, group := range ms.GetMetricFamiliesMap() {
+				if maps.Equal(group.Labels, labels) {
+					existed = true
+					break
+				}
+			}
+
+			done := make(chan error, 1)
 			ms.SubmitWriteRequest(storage.WriteRequest{
 				Labels:    labels,
 				Timestamp: time.Now(),
+				Done:      done,
 			})
+			// Wait until the delete request has been processed by the
+			// MetricStore. Only then is the deletion guaranteed to be
+			// reflected in subsequent scrapes.
+			for err := range done {
+				if err != nil {
+					logger.Error("failed to delete metric group", "job", job, "labels", labelsString, "remote_addr", r.RemoteAddr, "err", err.Error())
+				}
+			}
+			logger.Info(
+				"metric group deleted",
+				"job", job,
+				"labels", labelsString,
+				"existed", existed,
+				"remote_addr", r.RemoteAddr,
+			)
 			w.WriteHeader(http.StatusAccepted)
 		}),
 	)
