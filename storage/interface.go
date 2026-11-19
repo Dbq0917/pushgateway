@@ -93,11 +93,17 @@ type MetricStore interface {
 // The Done channel may be nil. If it is not nil, it will be closed once the
 // write request is processed. Any errors occurring during processing are sent to
 // the channel before closing it.
+//
+// If Rejected is true, the request is not applied to the stored metrics.
+// Instead, the failed-push timestamp is updated to Timestamp. This allows the
+// HTTP layer to reject invalid requests synchronously without bypassing the
+// store's failed-push accounting.
 type WriteRequest struct {
 	Labels         map[string]string
 	Timestamp      time.Time
 	MetricFamilies map[string]*dto.MetricFamily
 	Replace        bool
+	Rejected       bool
 	Done           chan error
 }
 

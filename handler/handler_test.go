@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
@@ -317,18 +319,17 @@ func TestPush(t *testing.T) {
 	}
 
 	handler(w, req.WithContext(ctxWithParams(params, req)))
-	// Note that a real storage shourd reject pushes with timestamps. Here
-	// we only make sure it gets through. Rejection is tested in the storage
-	// package.
-	if expected, got := http.StatusOK, w.Code; expected != got {
+	if expected, got := http.StatusBadRequest, w.Code; expected != got {
 		t.Errorf("Wanted status code %v, got %v.", expected, got)
 	}
-	// Make sure the timestamp from the push didn't make it to the WriteRequest.
-	if time.Since(mms.lastWriteRequest.Timestamp) > time.Minute {
-		t.Errorf("Write request timestamp set to a too low value: %#v", mms.lastWriteRequest)
+	if !strings.Contains(w.Body.String(), "must not have timestamps") {
+		t.Errorf("Wanted timestamp error in response body, got %q.", w.Body.String())
 	}
-	if expected, got := int64(1000), mms.lastWriteRequest.MetricFamilies["b"].GetMetric()[0].GetTimestampMs(); expected != got {
-		t.Errorf("Wanted protobuf timestamp %v, got %v.", expected, got)
+	if !mms.lastWriteRequest.Rejected {
+		t.Errorf("Wanted rejected write request, got %#v.", mms.lastWriteRequest)
+	}
+	if mms.lastWriteRequest.MetricFamilies != nil {
+		t.Errorf("Wanted rejected write request without metric families, got %#v.", mms.lastWriteRequest.MetricFamilies)
 	}
 
 	// With job name and instance name and protobuf content.
@@ -434,6 +435,87 @@ func TestPush(t *testing.T) {
 	verifyMetricFamily(t, `name:"another_metric" type:UNTYPED metric:{untyped:{value:3.14}}`, mms.lastWriteRequest.MetricFamilies["another_metric"])
 	// Note that sanitation hasn't happened yet, grouping labels not in request.
 	verifyMetricFamily(t, `name:"histogram_metric" type:HISTOGRAM metric:{histogram:{sample_count_float:20  sample_sum:99.23  schema:1  negative_span:{offset:0  length:2}  negative_span:{offset:0  length:2}  negative_count:2  negative_count:2  negative_count:-2  negative_count:0  positive_span:{offset:0  length:2}  positive_span:{offset:0  length:2}  positive_count:2  positive_count:2  positive_count:-2  positive_count:0}}`, mms.lastWriteRequest.MetricFamilies["histogram_metric"])
+}
+
+func TestPushWithoutConsistencyCheckRemainsAsynchronous(t *testing.T) {
+	mms := MockMetricStore{}
+	handler := Push(&mms, false, false, false, logger)
+	req, err := http.NewRequest(
+		"POST", "http://example.org/",
+		bytes.NewBufferString("some_metric 3.14\n"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := map[string]string{"job": "testjob"}
+
+	w := httptest.NewRecorder()
+	handler(w, req.WithContext(ctxWithParams(params, req)))
+	if expected, got := http.StatusAccepted, w.Code; expected != got {
+		t.Errorf("Wanted status code %v, got %v.", expected, got)
+	}
+	if mms.lastWriteRequest.Done != nil {
+		t.Errorf("Wanted asynchronous write request without Done channel, got %#v.", mms.lastWriteRequest)
+	}
+}
+
+func TestPushWithOldTimestampRejectedWithoutConsistencyCheck(t *testing.T) {
+	dms := storage.NewDiskMetricStore("", time.Hour, nil, logger)
+	handler := Push(dms, false, false, false, logger)
+	params := map[string]string{"job": "testjob"}
+	oldTimestamp := time.Now().Add(-4 * time.Hour).UnixMilli()
+
+	req, err := http.NewRequest(
+		"POST", "http://example.org/",
+		bytes.NewBufferString("some_metric 1\n"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	handler(w, req.WithContext(ctxWithParams(params, req)))
+	if expected, got := http.StatusAccepted, w.Code; expected != got {
+		t.Fatalf("Wanted status code %v for initial push, got %v.", expected, got)
+	}
+
+	droppedBefore := promtestutil.ToFloat64(pushDropped.WithLabelValues("invalid_timestamp"))
+	req, err = http.NewRequest(
+		"POST", "http://example.org/",
+		bytes.NewBufferString(fmt.Sprintf("some_metric 2 %d\n", oldTimestamp)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	handler(w, req.WithContext(ctxWithParams(params, req)))
+	if expected, got := http.StatusBadRequest, w.Code; expected != got {
+		t.Fatalf("Wanted status code %v for old timestamp, got %v.", expected, got)
+	}
+	if !strings.Contains(w.Body.String(), "must not have timestamps") {
+		t.Errorf("Wanted timestamp error in response body, got %q.", w.Body.String())
+	}
+	if dropped := promtestutil.ToFloat64(pushDropped.WithLabelValues("invalid_timestamp")) - droppedBefore; dropped != 1 {
+		t.Errorf("Wanted one dropped push, got %v.", dropped)
+	}
+
+	if err := dms.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	var metricValue, failedAt float64
+	for _, mf := range dms.GetMetricFamilies() {
+		switch mf.GetName() {
+		case "some_metric":
+			metricValue = mf.GetMetric()[0].GetUntyped().GetValue()
+		case "push_failure_time_seconds":
+			failedAt = mf.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	if expected, got := float64(1), metricValue; expected != got {
+		t.Errorf("Wanted metric value %v, got %v.", expected, got)
+	}
+	if failedAt == 0 {
+		t.Error("Wanted rejected push to update push_failure_time_seconds.")
+	}
 }
 
 func TestPushUTF8(t *testing.T) {

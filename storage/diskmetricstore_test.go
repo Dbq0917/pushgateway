@@ -1056,6 +1056,20 @@ func TestNoPersistence(t *testing.T) {
 	}
 }
 
+func TestValidateWriteRequestRejectsTimestamps(t *testing.T) {
+	err := ValidateWriteRequest(WriteRequest{
+		MetricFamilies: testutil.MetricFamiliesMap(mf1ts),
+	})
+	if !IsTimestampError(err) {
+		t.Errorf("Expected timestamp error, got %v.", err)
+	}
+	if err := ValidateWriteRequest(WriteRequest{
+		MetricFamilies: testutil.MetricFamiliesMap(mf1a),
+	}); err != nil {
+		t.Errorf("Expected valid write request, got %v.", err)
+	}
+}
+
 func TestRejectTimestamps(t *testing.T) {
 	dms := NewDiskMetricStore("", 100*time.Millisecond, nil, logger)
 
@@ -1073,8 +1087,8 @@ func TestRejectTimestamps(t *testing.T) {
 	})
 	var err error
 	for err = range errCh {
-		if err != errTimestamp {
-			t.Errorf("Expected error %q, got %q.", errTimestamp, err)
+		if err != ErrTimestamp {
+			t.Errorf("Expected error %q, got %q.", ErrTimestamp, err)
 		}
 	}
 	if err == nil {
@@ -1277,8 +1291,8 @@ func TestReplace(t *testing.T) {
 	})
 	var err error
 	for err = range errCh {
-		if err != errTimestamp {
-			t.Errorf("Expected error %q, got %q.", errTimestamp, err)
+		if err != ErrTimestamp {
+			t.Errorf("Expected error %q, got %q.", ErrTimestamp, err)
 		}
 	}
 	if err == nil {
@@ -1349,8 +1363,8 @@ func TestReplace(t *testing.T) {
 	})
 	err = nil
 	for err = range errCh {
-		if err != errTimestamp {
-			t.Errorf("Expected error %q, got %q.", errTimestamp, err)
+		if err != ErrTimestamp {
+			t.Errorf("Expected error %q, got %q.", ErrTimestamp, err)
 		}
 	}
 	if err == nil {

@@ -42,7 +42,8 @@ const (
 	writeQueueCapacity   = 1000
 )
 
-var errTimestamp = errors.New("pushed metrics must not have timestamps")
+// ErrTimestamp is returned when a pushed metric contains a timestamp.
+var ErrTimestamp = errors.New("pushed metrics must not have timestamps")
 
 // DiskMetricStore is an implementation of MetricStore that persists metrics to
 // disk.
@@ -107,6 +108,23 @@ func NewDiskMetricStore(
 // SubmitWriteRequest implements the MetricStore interface.
 func (dms *DiskMetricStore) SubmitWriteRequest(req WriteRequest) {
 	dms.writeQueue <- req
+}
+
+// ValidateWriteRequest performs inexpensive validation that does not require
+// access to the stored metrics. Callers can use it before submitting a request
+// to report basic validation failures synchronously, even when the expensive
+// consistency check is disabled.
+func ValidateWriteRequest(req WriteRequest) error {
+	if req.MetricFamilies != nil && timestampsPresent(req.MetricFamilies) {
+		return ErrTimestamp
+	}
+	return nil
+}
+
+// IsTimestampError reports whether err was caused by pushed metrics carrying
+// timestamps.
+func IsTimestampError(err error) bool {
+	return errors.Is(err, ErrTimestamp)
 }
 
 // Shutdown implements the MetricStore interface.
@@ -230,7 +248,9 @@ func (dms *DiskMetricStore) loop(persistenceInterval time.Duration) {
 		select {
 		case wr := <-dms.writeQueue:
 			lastWrite = time.Now()
-			if dms.checkWriteRequest(wr) {
+			if wr.Rejected {
+				dms.setPushFailedTimestamp(wr)
+			} else if dms.checkWriteRequest(wr) {
 				dms.processWriteRequest(wr)
 			} else {
 				dms.setPushFailedTimestamp(wr)
@@ -251,7 +271,9 @@ func (dms *DiskMetricStore) loop(persistenceInterval time.Duration) {
 			for {
 				select {
 				case wr := <-dms.writeQueue:
-					if dms.checkWriteRequest(wr) {
+					if wr.Rejected {
+						dms.setPushFailedTimestamp(wr)
+					} else if dms.checkWriteRequest(wr) {
 						dms.processWriteRequest(wr)
 					} else {
 						dms.setPushFailedTimestamp(wr)
@@ -360,8 +382,7 @@ func (dms *DiskMetricStore) checkWriteRequest(wr WriteRequest) bool {
 		}
 	}()
 
-	if timestampsPresent(wr.MetricFamilies) {
-		err = errTimestamp
+	if err = ValidateWriteRequest(wr); err != nil {
 		return false
 	}
 	for _, mf := range wr.MetricFamilies {

@@ -118,31 +118,58 @@ func Push(
 			return
 		}
 		now := time.Now()
+		wr := storage.WriteRequest{
+			Labels:         labels,
+			Timestamp:      now,
+			MetricFamilies: metricFamilies,
+			Replace:        replace,
+		}
+		if err := storage.ValidateWriteRequest(wr); err != nil {
+			reason := "invalid"
+			if storage.IsTimestampError(err) {
+				reason = "invalid_timestamp"
+			}
+			pushDropped.WithLabelValues(reason).Inc()
+
+			// Record the failed push without retaining the invalid metric
+			// payload in the write queue.
+			wr.MetricFamilies = nil
+			wr.Rejected = true
+			ms.SubmitWriteRequest(wr)
+
+			http.Error(
+				w,
+				fmt.Sprintf("pushed metrics are invalid: %v; push rejected (dropped) and no metrics were updated", err),
+				http.StatusBadRequest,
+			)
+			logger.Error(
+				"pushed metrics rejected",
+				"method", r.Method,
+				"source", r.RemoteAddr,
+				"err", err.Error(),
+			)
+			return
+		}
 		if !check {
-			ms.SubmitWriteRequest(storage.WriteRequest{
-				Labels:         labels,
-				Timestamp:      now,
-				MetricFamilies: metricFamilies,
-				Replace:        replace,
-			})
+			ms.SubmitWriteRequest(wr)
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
 		errCh := make(chan error, 1)
 		errReceived := false
-		ms.SubmitWriteRequest(storage.WriteRequest{
-			Labels:         labels,
-			Timestamp:      now,
-			MetricFamilies: metricFamilies,
-			Replace:        replace,
-			Done:           errCh,
-		})
+		wr.Done = errCh
+		ms.SubmitWriteRequest(wr)
 		for err := range errCh {
 			// Send only first error via HTTP, but log all of them.
 			// TODO(beorn): Consider sending all errors once we
 			// have a use case. (Currently, at most one error is
 			// produced.)
 			if !errReceived {
+				reason := "inconsistent"
+				if storage.IsTimestampError(err) {
+					reason = "invalid_timestamp"
+				}
+				pushDropped.WithLabelValues(reason).Inc()
 				http.Error(
 					w,
 					fmt.Sprintf("pushed metrics are invalid or inconsistent with existing metrics: %v", err),

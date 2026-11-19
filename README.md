@@ -243,7 +243,10 @@ of scraping'.)
 As there aren't any use cases where it would make sense to attach a
 different timestamp, and many users attempting to incorrectly do so (despite no
 client library supporting this), the Pushgateway rejects any pushes with
-timestamps.
+timestamps. This check happens before the push is queued, even if
+`--push.disable-consistency-check` is set, so such a push always receives a
+`400` response and never updates the stored metrics. Rejected pushes are counted
+in `pushgateway_push_dropped_total{reason="invalid_timestamp"}`.
 
 If you think you need to push a timestamp, please see [When To Use The
 Pushgateway](https://prometheus.io/docs/practices/pushing/).
@@ -382,11 +385,13 @@ The response code upon success is either 200, 202, or 400. A 200 response
 implies a successful push, either replacing an existing group of metrics or
 creating a new one. A 400 response can happen if the request is malformed or if
 the pushed metrics are inconsistent with metrics pushed to other groups or
-collide with metrics of the Pushgateway itself. An explanation is returned in
+collide with metrics of the Pushgateway itself. Pushes containing metric
+timestamps are also rejected with a 400 response. An explanation is returned in
 the body of the response and logged on error level. A 202 can only occur if the
-`--push.disable-consistency-check` flag is set. In this case, pushed metrics
-are just queued and not checked for consistency. Inconsistencies will lead to
-failed scrapes, however, as described [above](#about-metric-inconsistencies).
+`--push.disable-consistency-check` flag is set. In this case, pushed metrics are
+queued after inexpensive validation (including the timestamp check), but the
+expensive consistency check is skipped. Inconsistencies will lead to failed
+scrapes, however, as described [above](#about-metric-inconsistencies).
 
 In rare cases, it is possible that the Pushgateway ends up with an inconsistent
 set of metrics already pushed. In that case, new pushes are also rejected as
@@ -646,6 +651,10 @@ metrics. Those pushes are still counted as
 `pushgateway_http_requests_total{code="400",handler="push"}`. You can alert on
 the `rate` of this metric, but you have to inspect the logs to identify the
 offending pusher.
+
+Pushes that are rejected after parsing are also counted in
+`pushgateway_push_dropped_total`, labeled with the reason (for example,
+`invalid_timestamp` or `inconsistent`).
 
 ## TLS and basic authentication
 

@@ -45,6 +45,13 @@ var (
 		},
 		[]string{"method"},
 	)
+	pushDropped = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "pushgateway_push_dropped_total",
+			Help: "Total number of pushes that were rejected and did not update any metrics.",
+		},
+		[]string{"reason"},
+	)
 )
 
 // InstrumentWithCounter instruments an HTTP handler with a basic counter.
